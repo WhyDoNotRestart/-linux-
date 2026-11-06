@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=显示器亮度调节
+Comment=调节显示器亮度（综合支持外接屏软件Gamma、硬件DDC/CI及笔记本内置背光）
+Exec=/home/whynotresert/.local/bin/external-brightness-gui
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Utility;
+StartupNotify=true

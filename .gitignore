@@ -1,0 +1,5 @@
+sysmon/build/
+sysmon/dist/build/
+__pycache__/
+*.pyc
+.DS_Store

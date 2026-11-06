@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=sysmon 面板
+Comment=本机 CPU / 内存 / 网络 / 设备监控
+Exec=sh -c "xdg-open http://127.0.0.1:8787/"
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=monitor;system;cpu;memory;

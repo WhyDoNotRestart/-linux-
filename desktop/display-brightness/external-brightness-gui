@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""Unified Display Brightness Controller for Linux (Wayland & X11).
+
+Supports:
+- Software Gamma LUT scaling via GNOME Mutter DisplayConfig (Wayland) & xrandr (X11)
+  (100% compatible with any external monitor, including those without DDC/CI support like AMZ G25F5)
+- Hardware DDC/CI backlight control via ddcutil
+- Native laptop backlight control via Mutter Backlight & sysfs
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+
+try:
+    import dbus
+except ImportError:
+    dbus = None
+
+CONFIG_DIR = Path.home() / ".config" / "external-brightness"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"monitors": {}}
+
+
+def save_config(config):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+class DisplayBackend:
+    def __init__(self):
+        self.bus = None
+        self.mutter_iface = None
+        self.mutter_props = None
+        self.ddc_cache = {}
+        self.init_mutter()
+
+    def init_mutter(self):
+        if not dbus:
+            return
+        try:
+            self.bus = dbus.SessionBus()
+            obj = self.bus.get_object("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig")
+            self.mutter_iface = dbus.Interface(obj, "org.gnome.Mutter.DisplayConfig")
+            self.mutter_props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+        except Exception:
+            self.mutter_iface = None
+            self.mutter_props = None
+
+    def scan_monitors(self):
+        """Discover all connected displays and their capabilities."""
+        mutter_data = {}
+        if self.mutter_iface:
+            try:
+                serial, crtcs, outputs, modes, max_w, max_h = self.mutter_iface.GetResources()
+                for o in outputs:
+                    out_id = int(o[0])
+                    crtc_id = int(o[2])
+                    conn_name = str(o[4])
+                    props = o[7]
+                    mutter_data[conn_name] = {
+                        "out_id": out_id,
+                        "crtc_id": crtc_id,
+                        "display_name": str(props.get("display-name", "")),
+                        "vendor": str(props.get("vendor", "")),
+                        "product": str(props.get("product", "")),
+                    }
+            except Exception:
+                self.init_mutter()
+
+        monitors = []
+        for status_path in sorted(Path("/sys/class/drm").glob("card*-*/status")):
+            try:
+                if status_path.read_text().strip() != "connected":
+                    continue
+            except Exception:
+                continue
+
+            card_dir = status_path.parent
+            raw_name = card_dir.name
+            m = re.match(r"card\d+-(.+)", raw_name)
+            connector_tag = m.group(1) if m else raw_name
+            mutter_key = connector_tag.replace("-A-", "-")
+            is_builtin = any(t in raw_name for t in ("-eDP-", "-LVDS-", "-DSI-"))
+
+            # EDID friendly name
+            edid_name = ""
+            edid_file = card_dir / "edid"
+            if edid_file.exists():
+                try:
+                    data = edid_file.read_bytes()
+                    if len(data) >= 128:
+                        for offset in (54, 72, 90, 108):
+                            blk = data[offset : offset + 18]
+                            if blk[:3] == b"\x00\x00\x00" and blk[3] == 0xFC:
+                                edid_name = (
+                                    blk[5:].split(b"\x0a")[0].decode("ascii", errors="replace").strip()
+                                )
+                                break
+                except Exception:
+                    pass
+
+            ddc_bus = None
+            ddc_link = card_dir / "ddc"
+            if ddc_link.exists():
+                try:
+                    mb = re.search(r"i2c-(\d+)$", str(ddc_link.resolve()))
+                    if mb:
+                        ddc_bus = mb.group(1)
+                except Exception:
+                    pass
+
+            m_info = mutter_data.get(mutter_key) or mutter_data.get(connector_tag) or {}
+            disp_product = m_info.get("product", "")
+            if disp_product.startswith("0x"):
+                disp_product = ""
+            disp_name = m_info.get("display_name", "")
+            if disp_name == mutter_key:
+                disp_name = ""
+
+            if is_builtin:
+                friendly = "内置显示器"
+            else:
+                friendly = edid_name or disp_product or disp_name or raw_name
+
+            monitors.append(
+                {
+                    "id": f"{mutter_key}:{friendly}",
+                    "connector": mutter_key,
+                    "raw_name": raw_name,
+                    "friendly_name": friendly,
+                    "display_label": f"{friendly} ({mutter_key})",
+                    "is_builtin": is_builtin,
+                    "bus": ddc_bus,
+                    "crtc_id": m_info.get("crtc_id", 0),
+                }
+            )
+
+        return monitors
+
+    def test_ddc_support(self, bus):
+        """Quickly check if DDC/CI is responsive on given bus."""
+        if not bus:
+            return False
+        if bus in self.ddc_cache:
+            return self.ddc_cache[bus]
+
+        try:
+            res = subprocess.run(
+                ["ddcutil", "--bus", str(bus), "--maxtries", "1,1,1", "getvcp", "10"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            supported = res.returncode == 0 and "current value" in res.stdout
+        except Exception:
+            supported = False
+
+        self.ddc_cache[bus] = supported
+        return supported
+
+    def read_backlight(self, connector):
+        """Read native backlight value (0-100%)."""
+        if self.mutter_props:
+            try:
+                backlight = self.mutter_props.Get("org.gnome.Mutter.DisplayConfig", "Backlight")
+                for entry in backlight[1]:
+                    if str(entry.get("connector")) == connector:
+                        val = int(entry.get("value", 0))
+                        max_val = int(entry.get("max", 65535))
+                        min_val = int(entry.get("min", 0))
+                        pct = round((val - min_val) * 100 / max(1, (max_val - min_val)))
+                        return max(1, min(100, pct)), 100
+            except Exception:
+                pass
+
+        for path in Path("/sys/class/backlight").glob("*"):
+            try:
+                cur = int((path / "brightness").read_text().strip())
+                max_b = int((path / "max_brightness").read_text().strip())
+                return max(1, min(100, round(cur * 100 / max_b))), 100
+            except Exception:
+                pass
+        return 100, 100
+
+    def set_backlight(self, connector, percent):
+        """Set native backlight value (0-100%)."""
+        percent = max(1, min(100, percent))
+        if self.mutter_iface and self.mutter_props:
+            try:
+                backlight = self.mutter_props.Get("org.gnome.Mutter.DisplayConfig", "Backlight")
+                b_serial = backlight[0]
+                for entry in backlight[1]:
+                    if str(entry.get("connector")) == connector:
+                        max_val = int(entry.get("max", 65535))
+                        min_val = int(entry.get("min", 0))
+                        raw = int(min_val + percent * (max_val - min_val) / 100.0)
+                        self.mutter_iface.SetBacklight(b_serial, connector, raw)
+                        return
+            except Exception:
+                self.init_mutter()
+
+        # Fallback to brightnessctl if available
+        subprocess.run(["brightnessctl", "set", f"{percent}%"], capture_output=True, timeout=3, check=False)
+
+    def read_gamma(self, crtc_id, connector):
+        """Read software gamma brightness (10-100%)."""
+        if self.mutter_iface:
+            try:
+                serial, crtcs, outputs, modes, max_w, max_h = self.mutter_iface.GetResources()
+                r, g, b = self.mutter_iface.GetCrtcGamma(serial, crtc_id)
+                if r:
+                    val = round(max(r) * 100 / 65535)
+                    return max(10, min(100, val)), 100
+            except Exception:
+                self.init_mutter()
+
+        # X11 fallback
+        try:
+            res = subprocess.run(["xrandr", "--verbose"], capture_output=True, text=True, timeout=5, check=False)
+            match = re.search(
+                rf"^{re.escape(connector)} connected.*?^\s*Brightness:\s*([0-9.]+)",
+                res.stdout,
+                re.M | re.S,
+            )
+            if match:
+                return max(10, min(100, round(float(match.group(1)) * 100))), 100
+        except Exception:
+            pass
+
+        return 100, 100
+
+    def set_gamma(self, crtc_id, connector, percent):
+        """Set software gamma brightness (clamped 10-100% to prevent total black)."""
+        percent = max(10, min(100, percent))
+        factor = percent / 100.0
+
+        if self.mutter_iface:
+            try:
+                serial, crtcs, outputs, modes, max_w, max_h = self.mutter_iface.GetResources()
+                r, g, b = self.mutter_iface.GetCrtcGamma(serial, crtc_id)
+                lut_size = len(r) if r else 4096
+                ramp = [dbus.UInt16(int(round(i * 65535 / (lut_size - 1) * factor))) for i in range(lut_size)]
+                self.mutter_iface.SetCrtcGamma(serial, crtc_id, ramp, ramp, ramp)
+                return
+            except Exception:
+                self.init_mutter()
+                # Retry once with refreshed connection
+                if self.mutter_iface:
+                    try:
+                        serial, crtcs, outputs, modes, max_w, max_h = self.mutter_iface.GetResources()
+                        r, g, b = self.mutter_iface.GetCrtcGamma(serial, crtc_id)
+                        lut_size = len(r) if r else 4096
+                        ramp = [
+                            dbus.UInt16(int(round(i * 65535 / (lut_size - 1) * factor)))
+                            for i in range(lut_size)
+                        ]
+                        self.mutter_iface.SetCrtcGamma(serial, crtc_id, ramp, ramp, ramp)
+                        return
+                    except Exception:
+                        pass
+
+        # X11 fallback
+        subprocess.run(
+            ["xrandr", "--output", connector, "--brightness", f"{factor:.2f}"],
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+
+    def read_ddc(self, bus):
+        """Read hardware DDC/CI brightness."""
+        if not bus:
+            raise RuntimeError("此显示器未检测到 DDC I2C 总线")
+        res = subprocess.run(
+            ["ddcutil", "--bus", str(bus), "getvcp", "10"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "DDC/CI 读取失败")
+        match = re.search(r"current value\s*=\s*(\d+).*max value\s*=\s*(\d+)", res.stdout)
+        if not match or int(match.group(2)) == 0:
+            raise RuntimeError("无法解析 DDC/CI 返回的亮度数值")
+        cur, maximum = map(int, match.groups())
+        return round(cur * 100 / maximum), maximum
+
+    def set_ddc(self, bus, percent, maximum=100):
+        """Set hardware DDC/CI brightness."""
+        if not bus:
+            raise RuntimeError("此显示器未检测到 DDC I2C 总线")
+        raw = round(percent * maximum / 100)
+        res = subprocess.run(
+            ["ddcutil", "--bus", str(bus), "setvcp", "10", str(raw)],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "DDC/CI 设置失败")
+
+
+class BrightnessWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="显示器亮度调节")
+        self.set_default_size(460, 240)
+        self.backend = DisplayBackend()
+        self.config = load_config()
+        self.monitors = []
+        self.active_monitor = None
+        self.active_mode = "auto"  # "auto", "software", "ddc", "backlight"
+        self.resolved_mode = "software"
+        self.ddc_max = 100
+        self.updating = False
+        self.debounce_timer = 0
+        self.pending_value = None
+        self.busy = False
+
+        self.setup_ui()
+        self.scan()
+
+    def setup_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        root.set_margin_top(18)
+        root.set_margin_bottom(18)
+        root.set_margin_start(22)
+        root.set_margin_end(22)
+        self.set_child(root)
+
+        # Monitor row
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        root.append(top_row)
+
+        lbl_m = Gtk.Label(label="显示器:")
+        top_row.append(lbl_m)
+
+        self.selector = Gtk.DropDown.new_from_strings(["扫描中…"])
+        self.selector.set_hexpand(True)
+        self.selector.connect("notify::selected", self.on_monitor_changed)
+        top_row.append(self.selector)
+
+        refresh_btn = Gtk.Button.new_with_label("刷新")
+        refresh_btn.connect("clicked", lambda _: self.scan())
+        top_row.append(refresh_btn)
+
+        # Mode row
+        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        root.append(mode_row)
+
+        lbl_mode = Gtk.Label(label="调节方式:")
+        mode_row.append(lbl_mode)
+
+        self.mode_dropdown = Gtk.DropDown.new_from_strings(
+            ["自动选择 (推荐)", "软件亮度 (Gamma 通用调节)", "硬件背光 (DDC/CI)"]
+        )
+        self.mode_dropdown.set_hexpand(True)
+        self.mode_dropdown.connect("notify::selected", self.on_mode_changed)
+        mode_row.append(self.mode_dropdown)
+
+        # Scale slider row
+        scale_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        root.append(scale_box)
+
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10, 100, 1)
+        self.scale.set_draw_value(True)
+        self.scale.set_digits(0)
+        self.scale.set_hexpand(True)
+        self.scale.set_sensitive(False)
+        self.scale.connect("value-changed", self.on_scale_value_changed)
+        scale_box.append(self.scale)
+
+        # Preset buttons row
+        preset_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        preset_box.set_homogeneous(True)
+        root.append(preset_box)
+
+        for pct in (25, 50, 75, 100):
+            btn = Gtk.Button.new_with_label(f"{pct}%")
+            btn.connect("clicked", self.create_preset_handler(pct))
+            preset_box.append(btn)
+
+        # Status text
+        self.status = Gtk.Label(label="正在检测显示器…", xalign=0)
+        self.status.set_wrap(True)
+        root.append(self.status)
+
+    def create_preset_handler(self, pct):
+        return lambda _: self.scale.set_value(pct)
+
+    def scan(self):
+        self.monitors = self.backend.scan_monitors()
+        self.updating = True
+
+        if self.monitors:
+            labels = [m["display_label"] for m in self.monitors]
+            self.selector.set_model(Gtk.StringList.new(labels))
+            self.selector.set_selected(0)
+            self.active_monitor = self.monitors[0]
+            self.updating = False
+            self.load_active_monitor()
+        else:
+            self.selector.set_model(Gtk.StringList.new(["未检测到连接的显示器"]))
+            self.selector.set_selected(0)
+            self.scale.set_sensitive(False)
+            self.status.set_text("未检测到显示器，请确认线缆连接后点击‘刷新’。")
+            self.updating = False
+
+    def on_monitor_changed(self, *_args):
+        if self.updating or not self.monitors:
+            return
+        idx = self.selector.get_selected()
+        if idx < len(self.monitors):
+            self.active_monitor = self.monitors[idx]
+            self.load_active_monitor()
+
+    def on_mode_changed(self, *_args):
+        if self.updating or not self.active_monitor:
+            return
+        mode_idx = self.mode_dropdown.get_selected()
+        mode_map = {0: "auto", 1: "software", 2: "ddc"}
+        self.active_mode = mode_map.get(mode_idx, "auto")
+
+        # Save preference in config
+        m_id = self.active_monitor["id"]
+        if "monitors" not in self.config:
+            self.config["monitors"] = {}
+        if m_id not in self.config["monitors"]:
+            self.config["monitors"][m_id] = {}
+        self.config["monitors"][m_id]["preferred_mode"] = self.active_mode
+        save_config(self.config)
+
+        self.load_active_monitor()
+
+    def load_active_monitor(self):
+        mon = self.active_monitor
+        if not mon:
+            return
+
+        self.scale.set_sensitive(False)
+        self.status.set_text(f"正在配置 {mon['friendly_name']}…")
+
+        # Restore saved mode preference
+        m_id = mon["id"]
+        saved_mode = self.config.get("monitors", {}).get(m_id, {}).get("preferred_mode", "auto")
+        mode_indices = {"auto": 0, "software": 1, "ddc": 2}
+        self.updating = True
+        self.mode_dropdown.set_selected(mode_indices.get(saved_mode, 0))
+        self.active_mode = saved_mode
+        self.updating = False
+
+        def worker():
+            # Resolve actual mode
+            if mon["is_builtin"]:
+                resolved = "backlight"
+            elif self.active_mode == "software":
+                resolved = "software"
+            elif self.active_mode == "ddc":
+                resolved = "ddc"
+            else:
+                # auto mode: check if ddc is supported
+                has_ddc = self.backend.test_ddc_support(mon.get("bus"))
+                resolved = "ddc" if has_ddc else "software"
+
+            # Read brightness
+            err = None
+            val = 100
+            maximum = 100
+
+            try:
+                if resolved == "backlight":
+                    val, maximum = self.backend.read_backlight(mon["connector"])
+                elif resolved == "ddc":
+                    val, maximum = self.backend.read_ddc(mon.get("bus"))
+                else:
+                    # software gamma
+                    val, maximum = self.backend.read_gamma(mon.get("crtc_id", 0), mon["connector"])
+                    # If config has a previously saved brightness for this monitor, use it
+                    saved_val = self.config.get("monitors", {}).get(m_id, {}).get("brightness")
+                    if saved_val is not None:
+                        val = saved_val
+            except Exception as e:
+                err = str(e)
+                # If ddc failed in auto mode, fallback to software
+                if self.active_mode == "auto" and resolved == "ddc":
+                    resolved = "software"
+                    try:
+                        val, maximum = self.backend.read_gamma(mon.get("crtc_id", 0), mon["connector"])
+                        err = None
+                    except Exception as e2:
+                        err = str(e2)
+
+            GLib.idle_add(self.apply_monitor_reading, mon, resolved, val, maximum, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_monitor_reading(self, mon, resolved_mode, value, maximum, error):
+        if self.active_monitor != mon:
+            return False
+
+        self.resolved_mode = resolved_mode
+        self.ddc_max = maximum
+
+        mode_desc = {
+            "backlight": "笔记本内置背光",
+            "software": "软件亮度 (Gamma 调节 · 兼容所有屏幕)",
+            "ddc": "硬件背光 (DDC/CI 协议)",
+        }.get(resolved_mode, resolved_mode)
+
+        if error and resolved_mode == "ddc":
+            self.status.set_text(
+                f"硬件 DDC/CI 读取失败：{error}。\n提示：若该显示器不支持 DDC/CI，请将‘调节方式’切换为‘软件亮度’。"
+            )
+            self.scale.set_sensitive(False)
+            return False
+
+        self.updating = True
+        self.scale.set_value(value)
+        self.scale.set_sensitive(True)
+        self.updating = False
+
+        note = ""
+        if resolved_mode == "software" and not mon["is_builtin"]:
+            note = " · 已自动适配无感平滑调节"
+
+        self.status.set_text(f"当前亮度：{value}% · 模式：{mode_desc}{note}")
+        return False
+
+    def on_scale_value_changed(self, scale):
+        if self.updating or not self.active_monitor:
+            return
+        self.pending_value = round(scale.get_value())
+        if self.debounce_timer:
+            GLib.source_remove(self.debounce_timer)
+
+        # Software gamma is near-instantaneous (30ms debounce); DDC/CI needs ~200ms
+        delay = 30 if self.resolved_mode == "software" else 200
+        self.debounce_timer = GLib.timeout_add(delay, self.commit_brightness)
+
+    def commit_brightness(self):
+        self.debounce_timer = 0
+        if self.busy or self.pending_value is None or not self.active_monitor:
+            return False
+
+        val = self.pending_value
+        self.pending_value = None
+        mon = self.active_monitor
+        mode = self.resolved_mode
+        max_v = self.ddc_max
+
+        self.busy = True
+        self.status.set_text(f"正在调节为 {val}%…")
+
+        def worker():
+            err = None
+            try:
+                if mode == "backlight":
+                    self.backend.set_backlight(mon["connector"], val)
+                elif mode == "ddc":
+                    self.backend.set_ddc(mon.get("bus"), val, max_v)
+                else:
+                    self.backend.set_gamma(mon.get("crtc_id", 0), mon["connector"], val)
+            except Exception as e:
+                err = str(e)
+
+            GLib.idle_add(self.finish_commit, mon, val, mode, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def finish_commit(self, mon, val, mode, error):
+        self.busy = False
+        if self.active_monitor == mon:
+            if error:
+                self.status.set_text(f"调节失败：{error}")
+            else:
+                mode_desc = {
+                    "backlight": "笔记本内置背光",
+                    "software": "软件亮度",
+                    "ddc": "硬件背光 (DDC/CI)",
+                }.get(mode, mode)
+                self.status.set_text(f"当前亮度：{val}% ({mode_desc})")
+
+                # Save value in config
+                m_id = mon["id"]
+                if "monitors" not in self.config:
+                    self.config["monitors"] = {}
+                if m_id not in self.config["monitors"]:
+                    self.config["monitors"][m_id] = {}
+                self.config["monitors"][m_id]["brightness"] = val
+                save_config(self.config)
+
+        if self.pending_value is not None:
+            delay = 30 if self.resolved_mode == "software" else 150
+            self.debounce_timer = GLib.timeout_add(delay, self.commit_brightness)
+        return False
+
+
+class BrightnessApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="local.displaybrightness.control")
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if win is None:
+            win = BrightnessWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    BrightnessApp().run(sys.argv)

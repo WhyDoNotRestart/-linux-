@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=连接 ThinkPad 蓝牙键盘
+Comment=连接键盘；切换电脑后可引导重新配对
+Exec=/home/whynotresert/.local/bin/tpkb-switch
+Icon=input-keyboard
+Terminal=false
+Categories=Utility;

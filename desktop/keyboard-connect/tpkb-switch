@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Reconnect a ThinkPad Compact Bluetooth Keyboard, repairing its bond if needed."""
+import fcntl
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pexpect
+
+ADDRESS = "90:7F:61:11:01:29"
+TITLE = "ThinkPad 蓝牙键盘"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+PASSKEY = re.compile(r"Passkey:\s*([0-9]{6})")
+
+
+def bt(*args, timeout=20):
+    try:
+        return subprocess.run(
+            ["bluetoothctl", *args], capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def info():
+    result = bt("info", ADDRESS, timeout=5)
+    return result.stdout if result else ""
+
+
+def field(name):
+    match = re.search(rf"^\s*{re.escape(name)}:\s*(yes|no)\s*$", info(), re.M)
+    return match.group(1) == "yes" if match else False
+
+
+def has_keyboard_input_device():
+    """Check if the Linux input subsystem has registered the ThinkPad keyboard."""
+    try:
+        content = Path("/proc/bus/input/devices").read_text(encoding="utf-8", errors="ignore")
+        return "ThinkPad Compact Bluetooth Keyboard" in content
+    except Exception:
+        return False
+
+
+def is_connected():
+    """Verify that the keyboard is genuinely and steadily connected."""
+    res = bt("info", ADDRESS, timeout=3)
+    if not res or "Connected: yes" not in res.stdout:
+        return False
+    # If the Linux input device already exists and info shows connected, it is 100% connected
+    if has_keyboard_input_device():
+        return True
+    # Otherwise wait briefly to ensure it was not a transient handshake that drops
+    time.sleep(0.8)
+    res2 = bt("info", ADDRESS, timeout=3)
+    return bool(res2 and "Connected: yes" in res2.stdout)
+
+
+def try_connect(timeout=15):
+    """Attempt connection and verify it was genuinely established."""
+    res = bt("connect", ADDRESS, timeout=timeout)
+    if not res:
+        return False
+    # If bluetoothctl explicitly reported failure, do not trust any transient status
+    if res.returncode != 0 or "Failed to connect" in res.stdout or "Error" in res.stdout:
+        return False
+    time.sleep(0.8)
+    return is_connected()
+
+
+def dialog(kind, message, **options):
+    command = ["zenity", f"--{kind}", f"--title={TITLE}", f"--text={message}", "--width=420"]
+    for key, value in options.items():
+        command.append(f"--{key.replace('_', '-')}={value}")
+    return subprocess.run(command, check=False).returncode == 0
+
+
+def fail(message):
+    dialog("error", message)
+    return 1
+
+
+def pair():
+    child = pexpect.spawn("bluetoothctl", ["--agent", "KeyboardDisplay"],
+                          encoding="utf-8", timeout=1)
+    pin_window = None
+    try:
+        child.sendline("default-agent")
+        child.sendline(f"pair {ADDRESS}")
+        buffer = ""
+        passkey_shown = False
+        paired = False
+        paired_at = None
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if paired and time.monotonic() - paired_at >= 10:
+                return True
+            try:
+                chunk = child.read_nonblocking(size=4096, timeout=1)
+            except pexpect.TIMEOUT:
+                continue
+            except pexpect.EOF:
+                break
+            buffer = (buffer + ANSI.sub("", chunk))[-10000:]
+            if "Authorize service" in buffer and "(yes/no):" in buffer:
+                child.sendline("yes")
+                buffer = buffer.split("Authorize service", 1)[0]
+            if not passkey_shown:
+                match = PASSKEY.search(buffer)
+                if match:
+                    code = match.group(1)
+                    pin_window = subprocess.Popen([
+                        "zenity", "--info", f"--title={TITLE}", "--width=440",
+                        f"--text=请在 ThinkPad 蓝牙键盘上输入 {code}，然后按 Enter。\n\n不要在电脑键盘或此窗口中输入数字。",
+                        "--ok-label=我已输入",
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    passkey_shown = True
+            if "Pairing successful" in buffer and not paired:
+                paired = True
+                paired_at = time.monotonic()
+                child.sendline(f"trust {ADDRESS}")
+                buffer = buffer.replace("Pairing successful", "")
+            if "Failed to pair" in buffer or "AuthenticationFailed" in buffer:
+                return False
+        return paired
+    finally:
+        if pin_window and pin_window.poll() is None:
+            pin_window.terminate()
+        child.close(force=True)
+
+
+def ensure_bluetooth_on():
+    """Ensure Bluetooth is unblocked and powered on before continuing."""
+    try:
+        subprocess.run(["rfkill", "unblock", "bluetooth"], capture_output=True, timeout=3, check=False)
+    except Exception:
+        pass
+
+    res = bt("show", timeout=3)
+    if res and "Powered: yes" in res.stdout:
+        return True
+
+    bt("power", "on", timeout=5)
+    for _ in range(6):
+        time.sleep(0.5)
+        res = bt("show", timeout=3)
+        if res and "Powered: yes" in res.stdout:
+            return True
+
+    return False
+
+
+def main():
+    cache = os.path.join(os.path.expanduser("~"), ".cache")
+    os.makedirs(cache, exist_ok=True)
+    with open(os.path.join(cache, "tpkb-switch.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+
+        if not ensure_bluetooth_on():
+            return fail("无法开启本机蓝牙。请检查系统蓝牙服务（bluetooth.service）或硬件蓝牙开关。")
+
+        if is_connected():
+            dialog("info", "键盘已经连接。")
+            return 0
+
+        if field("Paired"):
+            if try_connect(timeout=15):
+                dialog("info", "键盘连接成功。")
+                return 0
+            # Give keyboard a moment in case it was in low-power sleep mode
+            time.sleep(1)
+            if try_connect(timeout=10):
+                dialog("info", "键盘连接成功。")
+                return 0
+
+        if not dialog(
+            "question",
+            "直接连接失败，需要重新配对。\n\n"
+            "1. 关闭另一台电脑的蓝牙，或在那台电脑上断开此键盘。\n"
+            "2. 在键盘上按 Fn+Delete，解除旧配对。\n"
+            "3. 将键盘侧面的电源滑钮向下拨并保持约 1 秒，直到绿灯闪烁。\n\n"
+            "准备好后点击“开始扫描”。本机的旧配对记录将被删除。",
+            ok_label="开始扫描", cancel_label="取消",
+        ):
+            return 0
+
+        bt("remove", ADDRESS, timeout=8)
+        scan = bt("--timeout", "18", "scan", "on", timeout=22)
+        found = (scan and (ADDRESS in scan.stdout or "ThinkPad" in scan.stdout)) or ("ThinkPad" in info())
+        if not found:
+            return fail("没有发现键盘。请确认绿灯正在闪烁，另一台电脑已断开，再双击桌面图标重试。")
+        if not pair():
+            return fail("配对没有完成。请重新让键盘绿灯闪烁，再双击桌面图标重试。")
+
+        bt("trust", ADDRESS, timeout=8)
+        if not is_connected():
+            try_connect(timeout=15)
+        if field("Paired") and field("Trusted") and is_connected():
+            dialog("info", "配对及连接成功。以后如果键盘没有切换到另一台电脑，双击图标即可直接重连。")
+            return 0
+        return fail("已尝试重新配对，但连接尚未成功。请关闭另一台电脑的蓝牙后重试。")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

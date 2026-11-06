@@ -1,0 +1,7 @@
+{
+  "uuid": "sysmon@local",
+  "name": "sysmon",
+  "description": "本机 CPU / 内存 / 网络 / 温度 / 进程，数据来自本地 sysmon 守护进程（127.0.0.1:8787）",
+  "shell-version": ["50"],
+  "version": 1
+}

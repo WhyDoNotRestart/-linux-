@@ -1,0 +1,14 @@
+[Unit]
+Description=sysmon 系统监控守护进程（本机 127.0.0.1:8787）
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sysmon --port 8787
+Restart=on-failure
+RestartSec=2
+MemoryMax=64M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

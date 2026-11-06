@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -u
+
+address='90:7F:61:11:01:29'
+notify=false
+if [[ ${1-} == --notify ]]; then
+  notify=true
+elif [[ $# -ne 0 ]]; then
+  printf '用法: tpkb [--notify]\n' >&2
+  exit 2
+fi
+
+report() {
+  local title=$1 message=$2
+  printf '%s: %s\n' "$title" "$message"
+  if [[ $notify == true ]] && command -v notify-send >/dev/null 2>&1; then
+    notify-send "$title" "$message"
+  fi
+}
+
+# Ensure Bluetooth is unblocked and turned on
+if command -v rfkill >/dev/null 2>&1; then
+  rfkill unblock bluetooth >/dev/null 2>&1 || true
+fi
+bluetoothctl power on >/dev/null 2>&1 || true
+
+is_really_connected() {
+  if ! bluetoothctl info "$address" 2>/dev/null | grep -q 'Connected: yes'; then
+    return 1
+  fi
+  if grep -q "ThinkPad Compact Bluetooth Keyboard" /proc/bus/input/devices 2>/dev/null; then
+    return 0
+  fi
+  sleep 0.8
+  bluetoothctl info "$address" 2>/dev/null | grep -q 'Connected: yes'
+  return $?
+}
+
+if is_really_connected; then
+  report 'ThinkPad 键盘' '已经连接。'
+  exit 0
+fi
+
+output=$(timeout 20s bluetoothctl connect "$address" 2>&1)
+status=$?
+
+if [[ $status -eq 0 ]] && ! grep -q -E "Failed to connect|br-connection-create-socket|Error" <<< "$output"; then
+  sleep 0.8
+  if is_really_connected; then
+    report 'ThinkPad 键盘' '连接成功。'
+    exit 0
+  fi
+fi
+
+printf '%s\n' "$output" >&2
+if [[ $status -eq 124 ]]; then
+  report 'ThinkPad 键盘连接失败' '连接超时。请打开键盘电源后重试。' >&2
+else
+  report 'ThinkPad 键盘连接失败' '直接连接失败（如曾切换设备请双击桌面图标重新配对）。' >&2
+fi
+exit 1
